@@ -27,7 +27,13 @@ main =
         }
 
 
-type alias Model =
+type Model
+    = Intro
+    | Game GamePlay
+    | End Int
+
+
+type alias GamePlay =
     { cellMap : CellGrid CellState
     , health : Int
     , survivedSoFar : Int
@@ -45,12 +51,16 @@ type CellState
 
 init : Flags -> ( Model, Cmd Msg )
 init flags =
-    ( { cellMap = initialCellGrid 3445768976564
-      , health = 10
-      , survivedSoFar = 0
-      }
+    ( Intro
     , Cmd.none
     )
+
+
+initGamePlay =
+    { cellMap = initialCellGrid 3445768976564
+    , health = 10
+    , survivedSoFar = 0
+    }
 
 
 initialCellGrid : Int -> CellGrid CellState
@@ -70,26 +80,38 @@ indicatorWidth =
 
 
 view : Model -> Html Msg
-view model =
-    if model.health <= 0 then
-        Html.text "YOU LOST!"
-
-    else
-        let
-            { natureCount, humanCount } =
-                evaluateBalance model.cellMap
-        in
-        Html.div []
-            [ CellGrid.Render.renderAsHtml (gridSize * itemSize) (gridSize * itemSize) cellRenderer model.cellMap
-                |> Html.map (\(CellGrid.Render.MouseClick coords _) -> Clicked coords)
-            , Html.p [] [ text "Health ", text (String.fromInt model.health) ]
-            , svg [ width indicatorWidth, height 30 ]
-                [ rect [ x 0, width (toFloat natureCount / (toFloat gridSize ^ 2) * indicatorWidth), height 20, fill (Fill natureColor) ] []
-                , rect [ x (toFloat natureCount / (toFloat gridSize ^ 2) * indicatorWidth), width (toFloat humanCount / (toFloat gridSize ^ 2) * indicatorWidth), height 20, fill (Fill humanColor) ] []
-                , line [ x1 (indicatorWidth / 2), x2 (indicatorWidth / 2), y1 21, y2 30, stroke (Color.rgb 0 0 0) ] []
+view top =
+    case top of
+        Intro ->
+            Html.div []
+                [ Html.p [] [ text "Your goal is to keep the ecosystem in a state of equilibrium. As long as there is perfect balance, your health will increase. But extreme imbalance will cause you to wither, until you die. Try to live as long as possible." ]
+                , Html.button [ Html.Events.onClick Next ] [ text "Start" ]
                 ]
-            , Html.p [] [ text (String.fromInt model.survivedSoFar) ]
-            ]
+
+        End score ->
+            Html.div []
+                [ Html.p [] [ text "You died! You survived for  ", text (String.fromInt score), text " seconds." ]
+                , Html.button [ Html.Events.onClick Next ] [ text "Try again" ]
+                ]
+
+        Game model ->
+            let
+                { natureCount, humanCount } =
+                    evaluateBalance model.cellMap
+            in
+            Html.div []
+                [ CellGrid.Render.renderAsHtml (gridSize * itemSize) (gridSize * itemSize) cellRenderer model.cellMap
+                    |> Html.map (\(CellGrid.Render.MouseClick coords _) -> Clicked coords)
+                , Html.p [] [ text "Health ", text (String.fromInt model.health) ]
+                , svg [ width indicatorWidth, height 30 ]
+                    [ rect [ x 0, width (toFloat natureCount / (toFloat gridSize ^ 2) * indicatorWidth), height 20, fill (Fill natureColor) ] []
+                    , rect [ x (toFloat natureCount / (toFloat gridSize ^ 2) * indicatorWidth), width (toFloat humanCount / (toFloat gridSize ^ 2) * indicatorWidth), height 20, fill (Fill humanColor) ] []
+                    , line [ x1 (indicatorWidth / 2), x2 (indicatorWidth / 2), y1 21, y2 30, stroke (Color.rgb 0 0 0) ] []
+                    , line [ x1 (indicatorWidth * 0.3), x2 (indicatorWidth * 0.3), y1 21, y2 30, stroke (Color.rgb 0.9 0 0) ] []
+                    , line [ x1 (indicatorWidth * 0.7), x2 (indicatorWidth * 0.7), y1 21, y2 30, stroke (Color.rgb 0.9 0 0) ] []
+                    ]
+                , Html.p [] [ text (String.fromInt model.survivedSoFar) ]
+                ]
 
 
 itemSize =
@@ -124,19 +146,37 @@ type Msg
     = Clicked ( Int, Int )
     | Evaluated (CellGrid CellState)
     | EndTurn
+    | Next
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
-    case msg of
-        Clicked coords ->
-            ( { model | cellMap = flipAtIndex coords model.cellMap }, Cmd.none )
+    case ( msg, model ) of
+        ( Next, Intro ) ->
+            ( Game initGamePlay, Cmd.none )
 
-        EndTurn ->
-            ( { model | survivedSoFar = model.survivedSoFar + 1 }, Random.generate Evaluated (ruleGenerator model.cellMap) )
+        ( Next, End _ ) ->
+            ( Game initGamePlay, Cmd.none )
 
-        Evaluated grid ->
-            ( { model | cellMap = grid, health = modifyHealth model }, Cmd.none )
+        ( Clicked coords, Game gamePlay ) ->
+            ( Game { gamePlay | cellMap = flipAtIndex coords gamePlay.cellMap }, Cmd.none )
+
+        ( EndTurn, Game gamePlay ) ->
+            ( Game { gamePlay | survivedSoFar = gamePlay.survivedSoFar + 1 }, Random.generate Evaluated (ruleGenerator gamePlay.cellMap) )
+
+        ( Evaluated grid, Game gamePlay ) ->
+            let
+                newHealth =
+                    modifyHealth gamePlay
+            in
+            if newHealth <= 0 then
+                ( End gamePlay.survivedSoFar, Cmd.none )
+
+            else
+                ( Game { gamePlay | cellMap = grid, health = newHealth }, Cmd.none )
+
+        _ ->
+            ( model, Cmd.none )
 
 
 flipAtIndex : ( Int, Int ) -> CellGrid CellState -> CellGrid CellState
@@ -152,7 +192,7 @@ tolerance =
     { low = gridSize ^ 2 * 0.02 |> floor, high = gridSize ^ 2 * 0.4 |> floor }
 
 
-modifyHealth : Model -> Int
+modifyHealth : GamePlay -> Int
 modifyHealth { health, cellMap } =
     let
         { natureCount, humanCount } =
