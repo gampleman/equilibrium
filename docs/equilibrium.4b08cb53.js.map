@@ -1,0 +1,1 @@
+{"version":3,"sources":["index.js"],"names":["Elm","Main","init","node","document","body"],"mappings":";;;AAEA,aAFA,IAAA,EAAA,QAAA,kBAEAA,EAAIC,IAAAA,KAAKC,KAAK,CACNC,KAAMC,SAASC","file":"equilibrium.4b08cb53.js","sourceRoot":"..","sourcesContent":["import {Elm} from \"./src/Main.elm\"\n\nElm.Main.init({\n        node: document.body\n    });\n"]}
