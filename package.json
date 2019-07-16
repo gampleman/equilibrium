@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "parcel index.html",
-    "build": "parcel build index.html -d docs --public-url .",
+    "start": "parcel equilibrium.html",
+    "build": "parcel build equilibrium.html -d docs --public-url .",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",

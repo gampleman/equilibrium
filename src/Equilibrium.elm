@@ -1,4 +1,4 @@
-module Test2 exposing (main)
+port module Equilibrium exposing (main)
 
 import Array exposing (Array)
 import BoundingBox2d exposing (BoundingBox2d)
@@ -13,7 +13,8 @@ import Geometry.Svg
 import Html exposing (Attribute, Html, text)
 import Html.Attributes exposing (style)
 import Html.Events exposing (custom)
-import Json.Decode as D exposing (Decoder)
+import Json.Decode as D exposing (Decoder, Value)
+import Json.Encode
 import Path
 import Point2d exposing (Point2d)
 import Polygon2d exposing (Polygon2d)
@@ -31,6 +32,9 @@ import TypedSvg.Filters.Attributes as Fa
 import TypedSvg.Types exposing (CoordinateSystem(..), Fill(..), InValue(..), Transform(..))
 import Vector2d
 import VoronoiDiagram2d exposing (VoronoiDiagram2d)
+
+
+port saveScore : Value -> Cmd msg
 
 
 
@@ -58,12 +62,13 @@ type Stage
     | HowToPlay
     | Game GameModel
     | GameComplete { time : Float, currentLevel : Level }
+    | GameLost Level
     | LevelSelection
     | Transition Float Stage Stage
 
 
 type alias GameModel =
-    { sites : Array Site
+    { diagram : VoronoiDiagram2d Site
     , simulation : Force.State Int
     , areas : { nature : Float, human : Float }
     , seed : Random.Seed
@@ -71,10 +76,6 @@ type alias GameModel =
     , time : Float
     , currentLevel : Level
     }
-
-
-type alias Flags =
-    {}
 
 
 type alias Site =
@@ -125,12 +126,34 @@ levels =
       , seed = Random.initialSeed 432658723845932
       , goodTime = 30
       , badTime = 200
-      , maxPoints = 6000
+      , maxPoints = 5000
       , pointEvaporationRate = 0
       , stateDistribution = [ ( 0.5, Nature ), ( 0.5, Human ) ]
       , frenzy = 1
       , tolerance = 0.05
-      , introText = ""
+      , introText = "Fill up the meter by keeping the green and grey tiles equal in area"
+      }
+    , { id = 2
+      , seed = Random.initialSeed 445364353454932
+      , goodTime = 40
+      , badTime = 220
+      , maxPoints = 6000
+      , pointEvaporationRate = 1
+      , stateDistribution = [ ( 0.6, Nature ), ( 0.4, Human ) ]
+      , frenzy = 1
+      , tolerance = 0.02
+      , introText = "You'll have to be more precise and faster this time"
+      }
+    , { id = 3
+      , seed = Random.initialSeed 412356798765413
+      , goodTime = 50
+      , badTime = 260
+      , maxPoints = 6000
+      , pointEvaporationRate = 1
+      , stateDistribution = [ ( 0.3, Nature ), ( 0.7, Human ) ]
+      , frenzy = 3
+      , tolerance = 0.01
+      , introText = "The tiles are going crazy!"
       }
     ]
 
@@ -152,12 +175,16 @@ main =
 -- Init
 
 
-init : Flags -> ( Model, Cmd Msg )
+init : Value -> ( Model, Cmd Msg )
 init flags =
     ( { screen =
             BoundingBox2d.fromExtrema { minX = 0, maxX = 2300, minY = 0, maxY = 900 }
       , stage = Intro { frame = 0 }
-      , levelsAchieved = Dict.empty
+      , levelsAchieved =
+            D.decodeValue (D.keyValuePairs D.float) flags
+                |> Result.withDefault []
+                |> List.filterMap (\( k, v ) -> Maybe.map (\intKey -> ( intKey, v )) (String.toInt k))
+                |> Dict.fromList
       }
     , Task.perform (\{ viewport } -> ScreenSize (floor viewport.width) (floor viewport.height)) Browser.Dom.getViewport
     )
@@ -172,13 +199,16 @@ initGameModel : Level -> Model -> Model
 initGameModel level model =
     let
         ( sites, seed ) =
-            Random.step (gridGenerator model.screen level.stateDistribution) level.seed
+            Random.step (sitesGenerator model.screen level.stateDistribution) level.seed
+
+        diagram =
+            buildDiagram sites
     in
     model
         |> transitionTo
             (Game
-                { sites = sites
-                , simulation = updateSimulation model.screen sites
+                { diagram = diagram
+                , simulation = updateSimulation model.screen diagram
                 , areas = { human = 0, nature = 0 }
                 , seed = seed
                 , points = 0
@@ -188,8 +218,8 @@ initGameModel level model =
             )
 
 
-gridGenerator : BoundingBox2d -> List ( Float, CellState ) -> Random.Generator (Array Site)
-gridGenerator screen distribution =
+sitesGenerator : BoundingBox2d -> List ( Float, CellState ) -> Random.Generator (Array Site)
+sitesGenerator screen distribution =
     Random.map (List.indexedMap (\index site -> { site | id = index }) >> Array.fromList)
         (Random.list 40
             (Random.map3 (\x y state -> { x = x, y = y, vx = 0, vy = 0, id = -1, state = state })
@@ -215,8 +245,6 @@ update msg model =
     case ( msg, model.stage ) of
         ( ScreenSize w h, c ) ->
             ( { model | screen = BoundingBox2d.fromExtrema { minX = 0, maxX = toFloat w, minY = 0, maxY = toFloat h } }
-              -- for debugging
-              -- |> initGameModel
             , Cmd.none
             )
 
@@ -226,10 +254,17 @@ update msg model =
                     updateGame model.screen msg submodel
             in
             if newSubmodel.points > submodel.currentLevel.maxPoints then
-                ( { model | levelsAchieved = Dict.insert submodel.currentLevel.id newSubmodel.time model.levelsAchieved }
+                let
+                    scores =
+                        Dict.insert submodel.currentLevel.id (min (Dict.get submodel.currentLevel.id model.levelsAchieved |> Maybe.withDefault newSubmodel.time) newSubmodel.time) model.levelsAchieved
+                in
+                ( { model | levelsAchieved = scores }
                     |> transitionTo (GameComplete { time = newSubmodel.time, currentLevel = submodel.currentLevel })
-                , Cmd.none
+                , saveScore (Json.Encode.dict String.fromInt Json.Encode.float scores)
                 )
+
+            else if Array.length (VoronoiDiagram2d.vertices newSubmodel.diagram) <= 1 then
+                ( model |> transitionTo (GameLost newSubmodel.currentLevel), Cmd.none )
 
             else
                 ( { model | stage = Game newSubmodel }, Cmd.none )
@@ -259,7 +294,7 @@ update msg model =
             ( model |> transitionTo LevelSelection, Cmd.none )
 
         ( HowToPlayClicked, current ) ->
-            ( { model | stage = Transition 800 current HowToPlay }, Cmd.none )
+            ( transitionTo HowToPlay model, Cmd.none )
 
         ( StartLevel level, _ ) ->
             ( initGameModel level model, Cmd.none )
@@ -274,17 +309,21 @@ updateGame screen msg model =
         Clicked state x y ->
             let
                 maxId =
-                    model.sites |> Array.foldl (\{ id } -> max id) -1
+                    model.diagram
+                        |> VoronoiDiagram2d.vertices
+                        |> Array.foldl (\{ id } -> max id) -1
 
-                sites =
-                    Array.push { x = x, y = y, vx = 0, vy = 0, id = maxId + 1, state = flip model.currentLevel state } model.sites
+                diagram =
+                    model.diagram
+                        |> VoronoiDiagram2d.insertVertexBy siteToPoint { x = x, y = y, vx = 0, vy = 0, id = maxId + 1, state = flip model.currentLevel state }
+                        |> Result.withDefault VoronoiDiagram2d.empty
             in
-            { model | sites = sites, simulation = updateSimulation screen sites }
+            { model | diagram = diagram, simulation = updateSimulation screen diagram }
 
         Tick delta ->
             let
                 ( simulation, sites ) =
-                    Force.tick model.simulation (model.sites |> Array.toList)
+                    Force.tick model.simulation (model.diagram |> VoronoiDiagram2d.vertices |> Array.toList)
 
                 newSites =
                     List.map2
@@ -304,17 +343,21 @@ updateGame screen msg model =
                                 newSite
                         )
                         sites
-                        (Array.toList model.sites)
-                        |> Array.fromList
+                        (Array.toList (VoronoiDiagram2d.vertices model.diagram))
+
+                newModel =
+                    evaluateRules screen
+                        newSites
+                        { model
+                            | simulation = simulation
+                            , time = model.time + delta
+                        }
 
                 areas =
-                    updateAreas screen (buildDiagram newSites)
+                    updateAreas screen newModel.diagram
             in
-            { model
-                | simulation = simulation
-                , sites = newSites
-                , areas = areas
-                , time = model.time + delta
+            { newModel
+                | areas = areas
                 , points =
                     if aboutEqual model.currentLevel screen areas then
                         model.points + 10
@@ -322,30 +365,27 @@ updateGame screen msg model =
                     else
                         max 0 (model.points - model.currentLevel.pointEvaporationRate)
             }
-                |> evaluateRules screen
 
         _ ->
             model
 
 
-updateSimulation : BoundingBox2d -> Array Site -> Force.State Int
-updateSimulation screen sites =
+updateSimulation : BoundingBox2d -> VoronoiDiagram2d Site -> Force.State Int
+updateSimulation screen diagram =
     let
         center =
             Force.center (BoundingBox2d.midX screen) (BoundingBox2d.midY screen)
 
         manyBody =
-            sites
+            diagram
+                |> VoronoiDiagram2d.vertices
                 |> Array.toList
                 |> List.map .id
                 |> Force.manyBodyStrength -20
 
-        delaunay =
-            DelaunayTriangulation2d.fromVerticesBy siteToPoint sites
-                |> Result.withDefault DelaunayTriangulation2d.empty
-
         links =
-            computeEdges delaunay
+            VoronoiDiagram2d.toDelaunayTriangulation diagram
+                |> computeEdges
                 |> Force.customLinks 1
     in
     Force.simulation
@@ -356,6 +396,7 @@ updateSimulation screen sites =
         |> Force.iterations 1000
 
 
+computeEdges : DelaunayTriangulation2d Site -> List { source : Int, target : Int, distance : Float, strength : Maybe Float }
 computeEdges delaunay =
     List.foldl
         (\{ vertices } dict ->
@@ -373,6 +414,7 @@ computeEdges delaunay =
         |> Dict.values
 
 
+computeEdge : Site -> Site -> { source : Int, target : Int, distance : Float, strength : Maybe Float }
 computeEdge a b =
     let
         distance =
@@ -421,28 +463,32 @@ aboutEqual level screen { nature, human } =
 -- Rules
 
 
-evaluateRules : BoundingBox2d -> GameModel -> GameModel
-evaluateRules screen model =
+evaluateRules : BoundingBox2d -> List Site -> GameModel -> GameModel
+evaluateRules screen sites model =
     let
-        ( ( sites, needsSimulationUpdate ), seed ) =
-            Random.step (rules screen model) model.seed
+        ( ( newSites, needsSimulationUpdate ), seed ) =
+            Random.step (rules screen sites model) model.seed
+
+        diagram =
+            buildDiagram newSites
     in
     { model
-        | sites = sites
+        | diagram = diagram
         , seed = seed
         , simulation =
             if needsSimulationUpdate then
-                updateSimulation screen sites
+                updateSimulation screen diagram
 
             else
                 model.simulation
     }
 
 
-rules : BoundingBox2d -> GameModel -> Random.Generator ( Array Site, Bool )
-rules screen model =
+rules : BoundingBox2d -> List Site -> GameModel -> Random.Generator ( Array Site, Bool )
+rules screen sites model =
     ruleEngine screen
-        model.sites
+        sites
+        model.diagram
         [ outOfBoundsEliminationRule screen
         , jiggleRule model.currentLevel.frenzy
         , subsumptionRule
@@ -457,13 +503,9 @@ composeRules a b site neigbors =
             (List.foldr (\site1 gen -> Random.map2 (++) (b site1 neigbors) gen) (Random.constant []))
 
 
-ruleEngine : BoundingBox2d -> Array Site -> List Rule -> Random.Generator ( Array Site, Bool )
-ruleEngine screen sites ruleset =
+ruleEngine : BoundingBox2d -> List Site -> VoronoiDiagram2d Site -> List Rule -> Random.Generator ( Array Site, Bool )
+ruleEngine screen sites diagram ruleset =
     let
-        delaunay =
-            DelaunayTriangulation2d.fromVerticesBy siteToPoint sites
-                |> Result.withDefault DelaunayTriangulation2d.empty
-
         addToSet a b =
             Maybe.withDefault Set.empty
                 >> Set.insert a
@@ -471,7 +513,7 @@ ruleEngine screen sites ruleset =
                 >> Just
 
         neigborhood =
-            VoronoiDiagram2d.fromDelaunayTriangulation delaunay
+            diagram
                 |> VoronoiDiagram2d.polygons screen
                 |> List.map (\( site, poly ) -> ( site.id, ( site, poly ) ))
                 |> Dict.fromList
@@ -489,40 +531,36 @@ ruleEngine screen sites ruleset =
                         |> Dict.update c.id (addToSet a.id b.id)
                 )
                 Dict.empty
-                (DelaunayTriangulation2d.faces delaunay)
+                (DelaunayTriangulation2d.faces (VoronoiDiagram2d.toDelaunayTriangulation diagram))
                 |> Dict.map (\k set -> Set.toList set |> List.filterMap (\id -> Dict.get id neigborhood))
 
         fun =
             List.foldr composeRules (\site _ -> Random.constant [ site ]) ruleset
     in
-    if Array.length sites == 1 then
-        Random.constant ( sites, False )
+    sites
+        |> List.foldr
+            (\site gen ->
+                let
+                    currentNeigbors =
+                        Dict.get site.id neigbors |> Maybe.withDefault []
+                in
+                Random.map2
+                    (\h t ->
+                        case ( h, t ) of
+                            ( [ x ], ( xs, mod ) ) ->
+                                ( x :: xs, mod )
 
-    else
-        sites
-            |> Array.foldr
-                (\site gen ->
-                    let
-                        currentNeigbors =
-                            Dict.get site.id neigbors |> Maybe.withDefault []
-                    in
-                    Random.map2
-                        (\h t ->
-                            case ( h, t ) of
-                                ( [ x ], ( xs, mod ) ) ->
-                                    ( x :: xs, mod )
+                            ( [], ( xs, _ ) ) ->
+                                ( xs, True )
 
-                                ( [], ( xs, _ ) ) ->
-                                    ( xs, True )
-
-                                ( more, ( xs, _ ) ) ->
-                                    ( more ++ xs, True )
-                        )
-                        (fun site currentNeigbors)
-                        gen
-                )
-                (Random.constant ( [], False ))
-            |> Random.map (Tuple.mapFirst Array.fromList)
+                            ( more, ( xs, _ ) ) ->
+                                ( more ++ xs, True )
+                    )
+                    (fun site currentNeigbors)
+                    gen
+            )
+            (Random.constant ( [], False ))
+        |> Random.map (Tuple.mapFirst Array.fromList)
 
 
 withProbability : Float -> Rule -> Rule
@@ -549,13 +587,13 @@ outOfBoundsEliminationRule screen site n =
 
 jiggleRule : Float -> Rule
 jiggleRule frenzy =
-    withProbability 0.01
+    withProbability (0.01 * frenzy)
         (\site _ ->
             if site.state == Nature then
                 Random.map4 (\x0 x1 y0 y1 -> [ { site | vx = x0 + x1, vy = y0 + y1 } ])
-                    (Random.float (-5 * frenzy) (5 * frenzy))
                     (Random.float -5 5)
-                    (Random.float (-5 * frenzy) (5 * frenzy))
+                    (Random.float -5 5)
+                    (Random.float -5 5)
                     (Random.float -5 5)
 
             else
@@ -621,7 +659,7 @@ siteToPoint site =
 
 view : Model -> Html Msg
 view model =
-    Html.div [] (globalStyle :: viewStage model.levelsAchieved model.screen model.stage)
+    Html.div [ Html.Attributes.style "overflow" "hidden" ] (globalStyle :: viewStage model.levelsAchieved model.screen model.stage)
 
 
 viewStage : Dict Int Float -> BoundingBox2d -> Stage -> List (Html Msg)
@@ -630,28 +668,41 @@ viewStage levelsAchieved screen stage =
         Intro { frame } ->
             [ renderDiagram screen (buildDiagram (sitesFromLogo screen frame)) []
             , if frame > 200 then
-                Html.button [ Html.Events.onClick NewGame, style "position" "absolute", style "top" "60vh" ] [ Html.text "New Game" ]
+                Html.button [ Html.Events.onClick NewGame, style "position" "absolute", style "top" "60vh" ] [ Html.text "Play" ]
 
               else
                 Html.text ""
-            , if frame > 220 then
-                Html.button [ Html.Events.onClick HowToPlayClicked, style "position" "absolute", style "top" "75vh" ] [ Html.text "How to Play" ]
 
-              else
-                Html.text ""
+            -- , if frame > 220 then
+            --     Html.button [ Html.Events.onClick HowToPlayClicked, style "position" "absolute", style "top" "75vh" ] [ Html.text "How to Play" ]
+            --
+            --   else
+            --     Html.text ""
             ]
 
         Game gameModel ->
-            [ renderDiagram screen (buildDiagram gameModel.sites) [ scoreBoardView screen gameModel ]
+            [ renderDiagram screen gameModel.diagram [ scoreBoardView screen gameModel ]
+            , Html.p [ Html.Attributes.class "hint" ] [ Html.text gameModel.currentLevel.introText ]
             ]
 
-        GameComplete { time } ->
+        GameComplete { time, currentLevel } ->
             [ renderDiagram screen (buildDiagram (screenFrame screen)) []
             , Html.section []
                 [ Html.h2 [] [ Html.text "Well Done!" ]
                 , Html.h1 [] [ Html.text (String.fromInt (floor (time / 1000))) ]
                 , Html.p [] [ Html.text "You have completed the level in ", Html.text (String.fromInt (floor (time / 1000))), Html.text " seconds." ]
-                , Html.button [ Html.Events.onClick NewGame ] [ Html.text "Play again" ]
+                , Html.p [ Html.Attributes.class "star-popin" ] [ starRating currentLevel (Just time) ]
+                , Html.button [ Html.Events.onClick NewGame ] [ Html.text "Continue" ]
+                ]
+            ]
+
+        GameLost currentLevel ->
+            [ renderDiagram screen (buildDiagram (screenFrame screen)) []
+            , Html.section []
+                [ Html.h2 [] [ Html.text "Oh oh!" ]
+                , Html.p [] [ Html.text "Unfortunately the balance in the ecosystem was lost and everything died." ]
+                , Html.p [] [ Html.button [ Html.Events.onClick (StartLevel currentLevel) ] [ Html.text "Try Again" ] ]
+                , Html.p [] [ Html.button [ Html.Events.onClick NewGame ] [ Html.text "Level Selection" ] ]
                 ]
             ]
 
@@ -671,8 +722,13 @@ viewStage levelsAchieved screen stage =
                     1 + (Dict.keys levelsAchieved |> List.maximum |> Maybe.withDefault 0)
             in
             [ renderDiagram screen (buildDiagram (screenFrame screen)) []
-            , Html.section [] <|
-                List.map (\level -> viewLevelSelection (level.id <= nextOpenLevel) (Dict.get level.id levelsAchieved) level) levels
+            , Html.section []
+                [ Html.h2 [] [ Html.text "Select level" ]
+                , levels
+                    |> List.filter (\level -> level.id <= nextOpenLevel)
+                    |> List.map (\level -> viewLevelSelection (Dict.get level.id levelsAchieved) level)
+                    |> Html.div [ Html.Attributes.class "level-selection" ]
+                ]
             ]
 
         Transition _ before after ->
@@ -683,13 +739,40 @@ viewStage levelsAchieved screen stage =
             ]
 
 
-viewLevelSelection : Bool -> Maybe Float -> Level -> Html Msg
-viewLevelSelection open bestTime level =
-    if open then
-        Html.button [ Html.Events.onClick (StartLevel level) ] [ Html.text (String.fromInt level.id) ]
+viewLevelSelection : Maybe Float -> Level -> Html Msg
+viewLevelSelection bestTime level =
+    Html.button [ Html.Events.onClick (StartLevel level), Html.Attributes.class "level-button" ]
+        [ Html.h3 [] [ Html.text (String.fromInt level.id) ]
+        , starRating level bestTime
+        , Html.span []
+            [ Html.text (Maybe.withDefault "-" (Maybe.map (\t -> String.fromInt (floor (t / 1000)) ++ "s") bestTime)) ]
+        ]
 
-    else
-        Html.text (String.fromInt level.id)
+
+starRating : Level -> Maybe Float -> Html msg
+starRating level potentialBestTime =
+    case potentialBestTime of
+        Just bestTime ->
+            if bestTime <= 1000 * toFloat level.goodTime then
+                Html.span []
+                    [ Html.b [] [ Html.text "★★★" ] ]
+
+            else if bestTime <= 1000 * toFloat level.badTime then
+                Html.span []
+                    [ Html.b [] [ Html.text "★★" ]
+                    , Html.i [] [ Html.text "☆" ]
+                    ]
+
+            else
+                Html.span []
+                    [ Html.b [] [ Html.text "★" ]
+                    , Html.i [] [ Html.text "☆☆" ]
+                    ]
+
+        Nothing ->
+            Html.span []
+                [ Html.i [] [ Html.text "☆☆☆" ]
+                ]
 
 
 screenElement : BoundingBox2d -> List (Attribute msg) -> List (Html msg) -> Html msg
@@ -728,11 +811,12 @@ globalStyle =
             body {
                 padding: 0;
                 margin: 0;
-                transform-style: preserve-3d;
+                overflow: hidden;
             }
             body>div {
                 display: flex;
                 width: 100vw;
+                height: 100vh;
                 justify-content: center;
             }
             .transition .before {
@@ -766,6 +850,34 @@ globalStyle =
                     opacity: 0;
                 }
             }
+            .hint {
+                animation: 10s hint;
+                animation-delay: 1s;
+                transform: translate(110vw,0);
+                z-index: 24;
+                opacity: 0.1;
+                position: absolute;
+                bottom: 5vh;
+                left: 50px;
+                font: 36px Helvetica, sans-serif;
+                color: white;
+                text-shadow: 1px 1px 1px rgba(30%,30%,30%,30%);
+                pointer-events: none;
+            }
+            @keyframes hint {
+                10% {
+                    transform: translate(0,0);
+                    opacity: 1;
+                }
+                90% {
+                    transform: translate(0,0);
+                    opacity: 1;
+                }
+                100% {
+                    transform: translate(110vw,0);
+                    opacity: 0;
+                }
+            }
             svg {
                 position: absolute;
                 top:0;
@@ -781,6 +893,37 @@ globalStyle =
                 text-shadow: 1px 1px 1px rgba(30%,30%,30%,1);
                 width: 80vw;
                 max-width: 650px;
+            }
+            .level-selection {
+                display: flex;
+                flex-direction: row;
+            }
+            .level-button {
+                margin: 20px; display: flex; flex-direction: column;
+                border: 5px solid rgba(10%,75%,10%,1);
+                border-radius: 10px;
+                    box-sizing: border-box;
+                padding: 0;
+                align-items: stretch;
+                width: 150px;
+            }
+            .level-button:hover {
+                border-color: rgba(86%,81%,9%,1);
+            }
+            .level-button h3 {
+                font-size: 30px;
+            }
+            .level-button span {
+                background: rgba(10%,75%,10%,1);
+                color: rgba(30%,30%,30%,1);
+
+            }
+            .level-button:hover span {
+                background: rgba(86%,81%,9%,1);
+                color: rgba(30%,30%,30%,1);
+            }
+            .star-popin {
+                font-size: 64px;
             }
             h1 {
                 font-size: 90px;
@@ -806,6 +949,14 @@ globalStyle =
             button:hover {
                 color: rgba(86%,81%,9%,1);
             }
+            b {
+                color: rgba(86%,81%,9%,1);
+                font-weight: normal;
+            }
+            i {
+                font-style: normal;
+            }
+
         """
         ]
 
@@ -1061,8 +1212,8 @@ stateToColor state =
 decodeMousePosition : Decoder ( Float, Float )
 decodeMousePosition =
     D.map2 Tuple.pair
-        (D.oneOf [ D.field "offsetX" D.float, D.field "clientX" D.float ])
-        (D.oneOf [ D.field "offsetY" D.float, D.field "clientY" D.float ])
+        (D.oneOf [ D.field "clientX" D.float, D.field "offsetX" D.float ])
+        (D.oneOf [ D.field "clientY" D.float, D.field "offsetY" D.float ])
 
 
 logo =
