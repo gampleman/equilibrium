@@ -631,7 +631,10 @@ isolationRule =
 
 subscriptions : Model -> Sub Msg
 subscriptions model =
-    Browser.Events.onAnimationFrameDelta Tick
+    Sub.batch
+        [ Browser.Events.onAnimationFrameDelta Tick
+        , Browser.Events.onResize ScreenSize
+        ]
 
 
 
@@ -859,7 +862,7 @@ globalStyle =
                 position: absolute;
                 bottom: 5vh;
                 left: 50px;
-                font: 36px Helvetica, sans-serif;
+                font: 3.6vh Helvetica, sans-serif;
                 color: white;
                 text-shadow: 1px 1px 1px rgba(30%,30%,30%,30%);
                 pointer-events: none;
@@ -892,7 +895,7 @@ globalStyle =
                 color: white;
                 text-shadow: 1px 1px 1px rgba(30%,30%,30%,1);
                 width: 80vw;
-                max-width: 650px;
+                max-width: 850px;
             }
             .level-selection {
                 display: flex;
@@ -902,16 +905,16 @@ globalStyle =
                 margin: 20px; display: flex; flex-direction: column;
                 border: 5px solid rgba(10%,75%,10%,1);
                 border-radius: 10px;
-                    box-sizing: border-box;
+                box-sizing: border-box;
                 padding: 0;
                 align-items: stretch;
-                width: 150px;
+                width: 20vh;
             }
             .level-button:hover {
                 border-color: rgba(86%,81%,9%,1);
             }
             .level-button h3 {
-                font-size: 30px;
+                font-size: 3vh;
             }
             .level-button span {
                 background: rgba(10%,75%,10%,1);
@@ -923,21 +926,21 @@ globalStyle =
                 color: rgba(30%,30%,30%,1);
             }
             .star-popin {
-                font-size: 64px;
+                font-size: 6.4vh;
             }
             h1 {
-                font-size: 90px;
+                font-size: 9vh;
             }
             h2 {
-                font-size: 45px;
+                font-size: 4.5vh;
             }
             p {
-                font-size: 32px;
+                font-size: 3.2vh;
             }
             button {
                 margin: auto;
                 z-index: 10;
-                font-size: 32px;
+                font-size: 5vh;
                 border: none;
                 background: transparent;
                 color: rgba(10%,75%,10%,1);

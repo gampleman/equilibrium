@@ -1,0 +1,19 @@
+{
+  "short_name": "Equilibrium",
+  "name": "Equilibrium",
+  "icons": [
+    {
+      "src": "/media/icon192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "/media/icon512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "background_color": "rgb(128, 128, 128)",
+  "display": "fullscreen",
+  "orientation": "landscape"
+}
