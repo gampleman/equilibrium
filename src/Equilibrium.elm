@@ -15,6 +15,7 @@ import Html.Attributes exposing (style)
 import Html.Events exposing (custom)
 import Json.Decode as D exposing (Decoder, Value)
 import Json.Encode
+import Particle exposing (Particle)
 import Path
 import Point2d exposing (Point2d)
 import Polygon2d exposing (Polygon2d)
@@ -24,12 +25,12 @@ import Shape exposing (defaultPieConfig)
 import Task
 import Triangle2d exposing (Triangle2d)
 import TypedSvg exposing (circle, g, svg)
-import TypedSvg.Attributes exposing (fill, patternUnits, stroke, viewBox)
+import TypedSvg.Attributes exposing (fill, patternUnits, stroke, viewBox, y1)
 import TypedSvg.Attributes.InPx exposing (cx, cy, height, r, strokeWidth, width, x, x1, x2, y, y1, y2)
 import TypedSvg.Core
 import TypedSvg.Filters as Fe
 import TypedSvg.Filters.Attributes as Fa
-import TypedSvg.Types exposing (CoordinateSystem(..), Fill(..), InValue(..), Transform(..))
+import TypedSvg.Types exposing (CoordinateSystem(..), Fill(..), InValue(..), Opacity(..), Transform(..))
 import Vector2d
 import VoronoiDiagram2d exposing (VoronoiDiagram2d)
 
@@ -75,6 +76,7 @@ type alias GameModel =
     , points : Int
     , time : Float
     , currentLevel : Level
+    , particles : List (Particle CellState)
     }
 
 
@@ -234,6 +236,7 @@ initGameModel level model =
                 , points = 0
                 , time = 0
                 , currentLevel = level
+                , particles = []
                 }
             )
 
@@ -388,6 +391,7 @@ updateGame screen msg model =
 
                     else
                         max 0 (model.points - model.currentLevel.pointEvaporationRate)
+                , particles = List.filterMap (Particle.update delta) newModel.particles
             }
 
         _ ->
@@ -537,41 +541,78 @@ type alias Rule =
 evaluateRules : Float -> BoundingBox2d -> List Site -> GameModel -> GameModel
 evaluateRules delta screen sites model =
     let
-        ( ( newSites, needsSimulationUpdate ), seed ) =
-            Random.step (rules delta screen sites model) model.seed
+        neigborhood =
+            model.diagram
+                |> VoronoiDiagram2d.polygons screen
+                |> List.map (\( site, poly ) -> ( site.id, ( site, poly ) ))
+                |> Dict.fromList
+
+        ( ( newSites, removals ), seed ) =
+            Random.step (ruleEngine delta screen sites neigborhood model) model.seed
 
         diagram =
             buildDiagram newSites
+
+        ( newParticles, newSeed ) =
+            if List.isEmpty removals then
+                ( model.particles, seed )
+
+            else
+                Tuple.mapFirst (List.append model.particles)
+                    (Random.step
+                        (List.foldl
+                            (\removed ->
+                                Random.map2 (++)
+                                    (Particle.init (Random.constant removed.state)
+                                        |> Particle.withLifetime (Random.map2 (+) (Random.float 0 1) (Random.float 0 1))
+                                        |> Particle.withLocation
+                                            (Dict.get removed.id neigborhood
+                                                |> Maybe.andThen (Tuple.second >> Polygon2d.boundingBox)
+                                                |> Maybe.map BoundingBox2d.extrema
+                                                |> Maybe.map
+                                                    (\{ minX, maxX, minY, maxY } ->
+                                                        Random.map4 (\x0 x1 y0 y1 -> { x = minX + x0 + x1, y = minY + y0 + y1 })
+                                                            (Random.float 0 ((maxX - minX) / 2))
+                                                            (Random.float 0 ((maxX - minX) / 2))
+                                                            (Random.float 0 ((maxY - minY) / 2))
+                                                            (Random.float 0 ((maxY - minY) / 2))
+                                                    )
+                                                |> Maybe.withDefault (Random.constant { x = removed.x, y = removed.y })
+                                            )
+                                        |> Particle.withDirection (Random.float 0 (2 * pi))
+                                        |> Particle.withSpeed (Random.map2 (+) (Random.float 0 150) (Random.float 0 150))
+                                        |> Random.list 20
+                                    )
+                            )
+                            (Random.constant [])
+                            removals
+                        )
+                        seed
+                    )
     in
     { model
         | diagram = diagram
         , seed = seed
+        , particles = newParticles
         , simulation =
-            if needsSimulationUpdate then
-                updateSimulation screen diagram
+            if List.isEmpty removals then
+                model.simulation
 
             else
-                model.simulation
+                updateSimulation screen diagram
     }
 
 
-rules : Float -> BoundingBox2d -> List Site -> GameModel -> Random.Generator ( Array Site, Bool )
-rules delta screen sites model =
-    ruleEngine delta
-        screen
-        sites
-        model.diagram
-        [ outOfBoundsEliminationRule screen
-
-        -- , jiggleRule model.currentLevel.frenzy
-        , subsumptionRule
-        , isolationRule
-        ]
-
-
-ruleEngine : Float -> BoundingBox2d -> List Site -> VoronoiDiagram2d Site -> List Rule -> Random.Generator ( Array Site, Bool )
-ruleEngine delta screen sites diagram ruleset =
+ruleEngine : Float -> BoundingBox2d -> List Site -> Dict Int ( Site, Polygon2d ) -> GameModel -> Random.Generator ( Array Site, List Site )
+ruleEngine delta screen sites neigborhood model =
     let
+        ruleset =
+            [ outOfBoundsEliminationRule screen
+            , jiggleRule model.currentLevel.frenzy
+            , subsumptionRule
+            , isolationRule
+            ]
+
         normalized =
             delta / 1000
 
@@ -580,12 +621,6 @@ ruleEngine delta screen sites diagram ruleset =
                 >> Set.insert a
                 >> Set.insert b
                 >> Just
-
-        neigborhood =
-            diagram
-                |> VoronoiDiagram2d.polygons screen
-                |> List.map (\( site, poly ) -> ( site.id, ( site, poly ) ))
-                |> Dict.fromList
 
         neigbors =
             List.foldl
@@ -600,7 +635,7 @@ ruleEngine delta screen sites diagram ruleset =
                         |> Dict.update c.id (addToSet a.id b.id)
                 )
                 Dict.empty
-                (DelaunayTriangulation2d.faces (VoronoiDiagram2d.toDelaunayTriangulation diagram))
+                (DelaunayTriangulation2d.faces (VoronoiDiagram2d.toDelaunayTriangulation model.diagram))
                 |> Dict.map (\k set -> Set.toList set |> List.filterMap (\id -> Dict.get id neigborhood))
 
         selectRule site =
@@ -629,16 +664,22 @@ ruleEngine delta screen sites diagram ruleset =
                             ( [ x ], ( xs, mod ) ) ->
                                 ( x :: xs, mod )
 
-                            ( [], ( xs, _ ) ) ->
-                                ( xs, True )
+                            ( [], ( xs, removals ) ) ->
+                                ( xs, site :: removals )
 
-                            ( more, ( xs, _ ) ) ->
-                                ( more ++ xs, True )
+                            ( more, ( xs, removals ) ) ->
+                                ( more ++ xs
+                                , if List.filter (\m -> m.id == site.id) more |> List.isEmpty then
+                                    site :: removals
+
+                                  else
+                                    removals
+                                )
                     )
                     (selectRule site)
                     gen
             )
-            (Random.constant ( [], False ))
+            (Random.constant ( [], [] ))
         |> Random.map (Tuple.mapFirst Array.fromList)
 
 
@@ -784,7 +825,7 @@ viewStage levelsAchieved screen stage =
             ]
 
         Game gameModel ->
-            [ renderDiagram screen gameModel.diagram [ scoreBoardView screen gameModel ]
+            [ renderDiagram screen gameModel.diagram [ particleView gameModel.particles, scoreBoardView screen gameModel ]
             , Html.p [ Html.Attributes.class "hint" ] [ Html.text gameModel.currentLevel.introText ]
             ]
 
@@ -885,6 +926,27 @@ screenElement bbox attrs =
             BoundingBox2d.dimensions bbox
     in
     svg [ width w, height h, viewBox (BoundingBox2d.minX bbox) (BoundingBox2d.minY bbox) w h ]
+
+
+particleView : List (Particle CellState) -> Html msg
+particleView particles =
+    List.map
+        (\p ->
+            case Particle.data p of
+                Nature ->
+                    TypedSvg.circle [ cx (Particle.leftPixels p), cy (Particle.topPixels p), r 4, fill (Fill (stateToColor Nature)), stroke (Color.rgb 0.1 0.75 0.1), strokeWidth 2, TypedSvg.Attributes.opacity (Opacity (Particle.lifetimePercent p)) ] []
+
+                Human ->
+                    g [ TypedSvg.Attributes.transform [ Rotate 7 9 (Particle.directionDegrees p), Translate (Particle.leftPixels p) (Particle.topPixels p) ], TypedSvg.Attributes.opacity (Opacity (Particle.lifetimePercent p)) ]
+                        [ TypedSvg.path [ TypedSvg.Attributes.d "M7 0v18L14 9Z", fill (Fill (Color.rgb 0.3 0.3 0.3)) ] []
+                        , TypedSvg.path [ TypedSvg.Attributes.d "M7 0v18L0 9Z", fill (Fill (Color.rgb 0.32 0.32 0.29)) ] []
+                        ]
+
+                Ocean ->
+                    g [] []
+        )
+        particles
+        |> g []
 
 
 equilateralTriangle : Point2d -> Float -> Triangle2d
