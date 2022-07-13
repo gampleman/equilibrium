@@ -70,7 +70,7 @@ type Stage
 type alias GameModel =
     { diagram : VoronoiDiagram2d Site
     , simulation : Force.State Int
-    , areas : { nature : Float, human : Float }
+    , areas : { nature : Float, human : Float, ocean : Float }
     , seed : Random.Seed
     , points : Int
     , time : Float
@@ -91,10 +91,7 @@ type alias Site =
 type CellState
     = Nature
     | Human
-
-
-type alias Rule =
-    Site -> List ( Site, Polygon2d ) -> Random.Generator (List Site)
+    | Ocean
 
 
 type alias Level =
@@ -155,6 +152,17 @@ levels =
       , tolerance = 0.01
       , introText = "The tiles are going crazy!"
       }
+    , { id = 4
+      , seed = Random.initialSeed 372589457398
+      , goodTime = 50
+      , badTime = 260
+      , maxPoints = 6000
+      , pointEvaporationRate = 1
+      , stateDistribution = [ ( 0.4, Nature ), ( 0.59, Human ), ( 0.01, Ocean ) ]
+      , frenzy = 2
+      , tolerance = 0.02
+      , introText = "Blue tiles work a bit differently!"
+      }
     ]
 
 
@@ -186,6 +194,18 @@ init flags =
                 |> List.filterMap (\( k, v ) -> Maybe.map (\intKey -> ( intKey, v )) (String.toInt k))
                 |> Dict.fromList
       }
+        |> initGameModel
+            { id = 4
+            , seed = Random.initialSeed 372589457398
+            , goodTime = 50
+            , badTime = 260
+            , maxPoints = 6000
+            , pointEvaporationRate = 1
+            , stateDistribution = [ ( 0.4, Nature ), ( 0.59, Human ), ( 0.01, Ocean ) ]
+            , frenzy = 2
+            , tolerance = 0.05
+            , introText = "Blue tiles work a bit differently!"
+            }
     , Task.perform (\{ viewport } -> ScreenSize (floor viewport.width) (floor viewport.height)) Browser.Dom.getViewport
     )
 
@@ -209,7 +229,7 @@ initGameModel level model =
             (Game
                 { diagram = diagram
                 , simulation = updateSimulation model.screen diagram
-                , areas = { human = 0, nature = 0 }
+                , areas = { human = 0, nature = 0, ocean = 0 }
                 , seed = seed
                 , points = 0
                 , time = 0
@@ -332,7 +352,10 @@ updateGame screen msg model =
                                 v =
                                     Vector2d.fromComponents ( newSite.vx, newSite.vy )
                             in
-                            if Vector2d.length v > maxSpeed then
+                            if newSite.state == Ocean then
+                                oldSite
+
+                            else if Vector2d.length v > maxSpeed then
                                 let
                                     newV =
                                         Vector2d.fromPolarComponents ( maxSpeed, Vector2d.polarComponents v |> Tuple.second )
@@ -346,7 +369,8 @@ updateGame screen msg model =
                         (Array.toList (VoronoiDiagram2d.vertices model.diagram))
 
                 newModel =
-                    evaluateRules screen
+                    evaluateRules delta
+                        screen
                         newSites
                         { model
                             | simulation = simulation
@@ -405,13 +429,22 @@ computeEdges delaunay =
                     vertices
             in
             dict
-                |> Dict.insert ( min a.id b.id, max a.id b.id ) (computeEdge a b)
-                |> Dict.insert ( min b.id c.id, max b.id c.id ) (computeEdge b c)
-                |> Dict.insert ( min a.id c.id, max a.id c.id ) (computeEdge a c)
+                |> insertElligibleTile a b
+                |> insertElligibleTile b c
+                |> insertElligibleTile a c
         )
         Dict.empty
         (DelaunayTriangulation2d.faces delaunay)
         |> Dict.values
+
+
+insertElligibleTile : Site -> Site -> Dict ( Int, Int ) { source : Int, target : Int, distance : Float, strength : Maybe Float } -> Dict ( Int, Int ) { source : Int, target : Int, distance : Float, strength : Maybe Float }
+insertElligibleTile a b dict =
+    if a.state == Ocean || b.state == Ocean then
+        dict
+
+    else
+        Dict.insert ( min a.id b.id, max a.id b.id ) (computeEdge a b) dict
 
 
 computeEdge : Site -> Site -> { source : Int, target : Int, distance : Float, strength : Maybe Float }
@@ -434,7 +467,7 @@ computeEdge a b =
     }
 
 
-updateAreas : BoundingBox2d -> VoronoiDiagram2d Site -> { nature : Float, human : Float }
+updateAreas : BoundingBox2d -> VoronoiDiagram2d Site -> { nature : Float, human : Float, ocean : Float }
 updateAreas screen diagram =
     diagram
         |> VoronoiDiagram2d.polygons screen
@@ -446,28 +479,66 @@ updateAreas screen diagram =
 
                     Human ->
                         { totals | human = totals.human + Polygon2d.area poly }
+
+                    Ocean ->
+                        { totals | ocean = totals.ocean + Polygon2d.area poly }
             )
-            { human = 0, nature = 0 }
+            { human = 0, nature = 0, ocean = 0 }
 
 
-aboutEqual : Level -> BoundingBox2d -> { nature : Float, human : Float } -> Bool
-aboutEqual level screen { nature, human } =
+aboutEqual : Level -> BoundingBox2d -> { nature : Float, human : Float, ocean : Float } -> Bool
+aboutEqual level screen { nature, human, ocean } =
     let
         ( w, h ) =
             BoundingBox2d.dimensions screen
+
+        scores =
+            List.map
+                (\( _, cell ) ->
+                    case cell of
+                        Nature ->
+                            nature
+
+                        Human ->
+                            human
+
+                        Ocean ->
+                            ocean
+                )
+                level.stateDistribution
+
+        tolerance =
+            w * h * level.tolerance
+
+        aboutEqualHelp list =
+            case list of
+                [] ->
+                    False
+
+                [ x ] ->
+                    True
+
+                x :: y :: xs ->
+                    abs (x - y) < tolerance && aboutEqualHelp (y :: xs)
     in
-    abs (nature - human) < w * h * level.tolerance
+    aboutEqualHelp scores
 
 
 
 -- Rules
 
 
-evaluateRules : BoundingBox2d -> List Site -> GameModel -> GameModel
-evaluateRules screen sites model =
+type alias Rule =
+    ( Site -> List ( Site, Polygon2d ) -> Maybe Float
+    , Site -> Random.Generator (List Site)
+    )
+
+
+evaluateRules : Float -> BoundingBox2d -> List Site -> GameModel -> GameModel
+evaluateRules delta screen sites model =
     let
         ( ( newSites, needsSimulationUpdate ), seed ) =
-            Random.step (rules screen sites model) model.seed
+            Random.step (rules delta screen sites model) model.seed
 
         diagram =
             buildDiagram newSites
@@ -484,28 +555,26 @@ evaluateRules screen sites model =
     }
 
 
-rules : BoundingBox2d -> List Site -> GameModel -> Random.Generator ( Array Site, Bool )
-rules screen sites model =
-    ruleEngine screen
+rules : Float -> BoundingBox2d -> List Site -> GameModel -> Random.Generator ( Array Site, Bool )
+rules delta screen sites model =
+    ruleEngine delta
+        screen
         sites
         model.diagram
         [ outOfBoundsEliminationRule screen
-        , jiggleRule model.currentLevel.frenzy
+
+        -- , jiggleRule model.currentLevel.frenzy
         , subsumptionRule
         , isolationRule
         ]
 
 
-composeRules : Rule -> Rule -> Rule
-composeRules a b site neigbors =
-    a site neigbors
-        |> Random.andThen
-            (List.foldr (\site1 gen -> Random.map2 (++) (b site1 neigbors) gen) (Random.constant []))
-
-
-ruleEngine : BoundingBox2d -> List Site -> VoronoiDiagram2d Site -> List Rule -> Random.Generator ( Array Site, Bool )
-ruleEngine screen sites diagram ruleset =
+ruleEngine : Float -> BoundingBox2d -> List Site -> VoronoiDiagram2d Site -> List Rule -> Random.Generator ( Array Site, Bool )
+ruleEngine delta screen sites diagram ruleset =
     let
+        normalized =
+            delta / 1000
+
         addToSet a b =
             Maybe.withDefault Set.empty
                 >> Set.insert a
@@ -534,16 +603,26 @@ ruleEngine screen sites diagram ruleset =
                 (DelaunayTriangulation2d.faces (VoronoiDiagram2d.toDelaunayTriangulation diagram))
                 |> Dict.map (\k set -> Set.toList set |> List.filterMap (\id -> Dict.get id neigborhood))
 
-        fun =
-            List.foldr composeRules (\site _ -> Random.constant [ site ]) ruleset
+        selectRule site =
+            let
+                applicableRules =
+                    List.filterMap
+                        (\( probFn, evalFn ) ->
+                            let
+                                currentNeigbors =
+                                    Dict.get site.id neigbors |> Maybe.withDefault []
+                            in
+                            Maybe.map (\p -> ( p * normalized, evalFn site )) (probFn site currentNeigbors)
+                        )
+                        ruleset
+            in
+            Random.weighted ( 1 - List.sum (List.map Tuple.first applicableRules), Random.constant [ site ] )
+                applicableRules
+                |> Random.andThen identity
     in
     sites
         |> List.foldr
             (\site gen ->
-                let
-                    currentNeigbors =
-                        Dict.get site.id neigbors |> Maybe.withDefault []
-                in
                 Random.map2
                     (\h t ->
                         case ( h, t ) of
@@ -556,73 +635,91 @@ ruleEngine screen sites diagram ruleset =
                             ( more, ( xs, _ ) ) ->
                                 ( more ++ xs, True )
                     )
-                    (fun site currentNeigbors)
+                    (selectRule site)
                     gen
             )
             (Random.constant ( [], False ))
         |> Random.map (Tuple.mapFirst Array.fromList)
 
 
-withProbability : Float -> Rule -> Rule
-withProbability prob gen site n =
-    Random.weighted ( 1 - prob, False ) [ ( prob, True ) ]
-        |> Random.andThen
-            (\shouldWork ->
-                if shouldWork then
-                    gen site n
+withProbabilites : ({ nature : Maybe Float, ocean : Maybe Float, human : Maybe Float } -> { nature : Maybe Float, ocean : Maybe Float, human : Maybe Float }) -> (Site -> Random.Generator (List Site)) -> Rule
+withProbabilites probs fn =
+    let
+        p =
+            probs { nature = Nothing, ocean = Nothing, human = Nothing }
+    in
+    ( \site _ ->
+        case site.state of
+            Nature ->
+                p.nature
 
-                else
-                    Random.constant [ site ]
-            )
+            Ocean ->
+                p.ocean
+
+            Human ->
+                p.human
+    , fn
+    )
+
+
+eliminate : a -> Random.Generator (List b)
+eliminate _ =
+    Random.constant []
 
 
 outOfBoundsEliminationRule : BoundingBox2d -> Rule
-outOfBoundsEliminationRule screen site n =
-    if BoundingBox2d.contains (Point2d.fromCoordinates ( site.x, site.y )) screen then
-        Random.constant [ site ]
+outOfBoundsEliminationRule screen =
+    ( \site _ ->
+        if BoundingBox2d.contains (Point2d.fromCoordinates ( site.x, site.y )) screen then
+            Nothing
 
-    else
-        withProbability 0.1 (\_ _ -> Random.constant []) site n
+        else
+            Just 0.1
+    , eliminate
+    )
 
 
 jiggleRule : Float -> Rule
 jiggleRule frenzy =
-    withProbability (0.01 * frenzy)
-        (\site _ ->
-            if site.state == Nature then
-                Random.map4 (\x0 x1 y0 y1 -> [ { site | vx = x0 + x1, vy = y0 + y1 } ])
-                    (Random.float -5 5)
-                    (Random.float -5 5)
-                    (Random.float -5 5)
-                    (Random.float -5 5)
-
-            else
-                Random.constant [ site ]
+    withProbabilites (\r -> { r | nature = Just (0.2 * frenzy) })
+        (\site ->
+            Random.map4 (\x0 x1 y0 y1 -> [ { site | vx = x0 + x1, vy = y0 + y1 } ])
+                (Random.float -5 5)
+                (Random.float -5 5)
+                (Random.float -5 5)
+                (Random.float -5 5)
         )
 
 
 subsumptionRule : Rule
 subsumptionRule =
-    withProbability 0.01
-        (\site neibors ->
-            if List.all (\( n, _ ) -> n.state == site.state) neibors then
-                Random.constant []
+    ( \site neibors ->
+        if List.all (\( n, _ ) -> n.state == site.state) neibors then
+            Just 0.03
 
-            else
-                Random.constant [ site ]
-        )
+        else if List.all (\( n, _ ) -> n.state == site.state || n.state == Ocean) neibors then
+            Just 0.01
+
+        else
+            Nothing
+    , eliminate
+    )
 
 
 isolationRule : Rule
 isolationRule =
-    withProbability 0.05
-        (\site neibors ->
-            if List.all (\( n, _ ) -> n.state /= site.state) neibors then
-                Random.weighted ( List.foldl (\( _, poly ) total -> total + Polygon2d.area poly) 0 neibors ^ 2, [] ) [ ( 1000000 ^ 2, [ site ] ) ]
+    ( \site neibors ->
+        let
+            fst =
+                List.head neibors |> Maybe.map (Tuple.first >> .state) |> Maybe.withDefault site.state
+        in
+        if site.state /= Ocean && List.all (\( n, _ ) -> n.state /= site.state && n.state == fst) neibors then
+            Just (3 * (List.foldl (\( _, poly ) total -> total + Polygon2d.area poly) 0 neibors ^ 2 / 1000000 ^ 2))
 
-            else
-                Random.constant [ site ]
-        )
+        else
+            Nothing
+    , eliminate
+    )
 
 
 
@@ -650,6 +747,9 @@ flip level cell =
         Human ->
             Nature
 
+        Ocean ->
+            Ocean
+
 
 siteToPoint : Site -> Point2d
 siteToPoint site =
@@ -662,7 +762,7 @@ siteToPoint site =
 
 view : Model -> Html Msg
 view model =
-    Html.div [ Html.Attributes.style "overflow" "hidden" ] (globalStyle :: viewStage model.levelsAchieved model.screen model.stage)
+    Html.main_ [ Html.Attributes.style "overflow" "hidden" ] (globalStyle :: viewStage model.levelsAchieved model.screen model.stage)
 
 
 viewStage : Dict Int Float -> BoundingBox2d -> Stage -> List (Html Msg)
@@ -816,7 +916,7 @@ globalStyle =
                 margin: 0;
                 overflow: hidden;
             }
-            body>div {
+            main {
                 display: flex;
                 width: 100vw;
                 height: 100vh;
@@ -979,7 +1079,7 @@ scoreBoardView screen { areas, points, time, currentLevel } =
             ]
         :: (Shape.pie
                 { defaultPieConfig | innerRadius = 40, outerRadius = 50 }
-                [ areas.nature, areas.human ]
+                [ areas.nature, areas.human, areas.ocean ]
                 |> List.map2
                     (\state arc ->
                         Path.element (Shape.arc arc)
@@ -992,7 +1092,7 @@ scoreBoardView screen { areas, points, time, currentLevel } =
                                    )
                             )
                     )
-                    [ Nature, Human ]
+                    [ Nature, Human, Ocean ]
            )
         ++ [ TypedSvg.circle [ cx 0, cy 0, r innerRadius, fill (Fill (Color.rgb 0.8 0.2 0.2)), TypedSvg.Core.attribute "clip-path" "url(#score-clip)" ] []
            , TypedSvg.text_
@@ -1090,6 +1190,11 @@ renderDiagram clip diagram additional =
             [ TypedSvg.rect [ width 16, height 20, fill (Fill (Color.rgb 0.3 0.3 0.3)) ] []
             , TypedSvg.path [ TypedSvg.Attributes.d "M8 0v20L0 10M16 0v10L8 0M16 10v10H8", fill (Fill (Color.rgba 0.86 0.81 0.09 0.03)) ] []
             ]
+        , TypedSvg.pattern [ TypedSvg.Core.attribute "id" "sea-floor", viewBox 0 0 30 30, width 30, height 30, patternUnits CoordinateSystemUserSpaceOnUse ]
+            [ TypedSvg.rect [ width 31, height 31, fill (Fill (Color.rgb 0.1 0.1 0.8)) ] []
+            , TypedSvg.path [ TypedSvg.Attributes.d "M15 3L19 11L27 15L19 19L15 27L11 19L3 15L11 11Z", stroke (Color.rgba 1 1 1 0.2), fill (Fill (Color.rgba 0.5 0.5 0.5 0.2)) ] []
+            , TypedSvg.path [ TypedSvg.Attributes.d "M0 0L30 30M0 30L30 0L5 25L30 30L25 5L0 0L5 25M0 30L5 5L30 0L 25 25L0 30M0 13", stroke (Color.rgba 1 1 1 0.2), fill FillNone ] []
+            ]
         , TypedSvg.filter [ TypedSvg.Core.attribute "id" "glow", TypedSvg.Attributes.width (TypedSvg.Types.percent 300), TypedSvg.Attributes.height (TypedSvg.Types.percent 300) ]
             [ Fe.morphology [ Fa.morphologyOperator TypedSvg.Types.MorphologyOperatorDilate, Fa.radius 3 3, Fa.in_ InSourceGraphic, Fa.result "thicken" ]
                 []
@@ -1107,14 +1212,37 @@ renderDiagram clip diagram additional =
             (\( { state }, _ ) ->
                 case state of
                     Nature ->
-                        1
+                        2
 
                     Human ->
+                        1
+
+                    Ocean ->
                         0
             )
         |> List.concatMap
             (\( { state, x, y }, poly ) ->
                 case state of
+                    Ocean ->
+                        [ Geometry.Svg.polygon2d
+                            [ fill (Fill (stateToColor state))
+                            , stroke (Color.rgb 0.86 0.81 0.09)
+                            , strokeWidth 2
+                            , TypedSvg.Core.attribute "fill" "url(#sea-floor)"
+                            , custom "click"
+                                (D.map
+                                    (\( clx, cly ) ->
+                                        { message = Clicked state clx cly
+                                        , stopPropagation = True
+                                        , preventDefault = True
+                                        }
+                                    )
+                                    decodeMousePosition
+                                )
+                            ]
+                            poly
+                        ]
+
                     Human ->
                         [ Geometry.Svg.polygon2d
                             [ --fill (Fill (stateToColor state))
@@ -1210,6 +1338,9 @@ stateToColor state =
 
         Human ->
             Color.rgb 0.5 0.5 0.5
+
+        Ocean ->
+            Color.rgb 0.1 0.1 0.8
 
 
 decodeMousePosition : Decoder ( Float, Float )
