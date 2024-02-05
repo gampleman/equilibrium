@@ -10,7 +10,7 @@ import DelaunayTriangulation2d exposing (DelaunayTriangulation2d)
 import Dict exposing (Dict)
 import Force exposing (Force)
 import Geometry.Svg
-import Html exposing (Attribute, Html, text)
+import Html exposing (Attribute, Html, p, text)
 import Html.Attributes exposing (style)
 import Html.Events exposing (custom)
 import Json.Decode as D exposing (Decoder, Value)
@@ -20,6 +20,7 @@ import Path
 import Point2d exposing (Point2d)
 import Polygon2d exposing (Polygon2d)
 import Random
+import Scale
 import Set exposing (Set)
 import Shape exposing (defaultPieConfig)
 import Task
@@ -44,7 +45,7 @@ port saveScore : Value -> Cmd msg
 
 type Msg
     = Tick Float
-    | Clicked CellState Float Float
+    | Clicked Int CellState Float Float
     | ScreenSize Int Int
     | NewGame
     | HowToPlayClicked
@@ -71,7 +72,7 @@ type Stage
 type alias GameModel =
     { diagram : VoronoiDiagram2d Site
     , simulation : Force.State Int
-    , areas : { nature : Float, human : Float, ocean : Float }
+    , areas : { nature : Float, human : Float, ocean : Float, fire : Float }
     , seed : Random.Seed
     , points : Int
     , time : Float
@@ -94,6 +95,7 @@ type CellState
     = Nature
     | Human
     | Ocean
+    | Fire Float
 
 
 type alias Level =
@@ -203,7 +205,7 @@ init flags =
             , badTime = 260
             , maxPoints = 6000
             , pointEvaporationRate = 1
-            , stateDistribution = [ ( 0.4, Nature ), ( 0.59, Human ), ( 0.01, Ocean ) ]
+            , stateDistribution = [ ( 0.4, Nature ), ( 0.59, Human ), ( 0.01, Fire 5000 ) ]
             , frenzy = 2
             , tolerance = 0.05
             , introText = "Blue tiles work a bit differently!"
@@ -231,7 +233,7 @@ initGameModel level model =
             (Game
                 { diagram = diagram
                 , simulation = updateSimulation model.screen diagram
-                , areas = { human = 0, nature = 0, ocean = 0 }
+                , areas = { human = 0, nature = 0, ocean = 0, fire = 0 }
                 , seed = seed
                 , points = 0
                 , time = 0
@@ -329,7 +331,7 @@ update msg model =
 updateGame : BoundingBox2d -> Msg -> GameModel -> GameModel
 updateGame screen msg model =
     case msg of
-        Clicked state x y ->
+        Clicked id_ state x y ->
             let
                 maxId =
                     model.diagram
@@ -337,9 +339,17 @@ updateGame screen msg model =
                         |> Array.foldl (\{ id } -> max id) -1
 
                 diagram =
-                    model.diagram
-                        |> VoronoiDiagram2d.insertVertexBy siteToPoint { x = x, y = y, vx = 0, vy = 0, id = maxId + 1, state = flip model.currentLevel state }
-                        |> Result.withDefault VoronoiDiagram2d.empty
+                    case state of
+                        Fire _ ->
+                            model.diagram
+                                |> VoronoiDiagram2d.vertices
+                                |> Array.filter (\a -> a.id /= id_)
+                                |> buildDiagram
+
+                        _ ->
+                            model.diagram
+                                |> VoronoiDiagram2d.insertVertexBy siteToPoint { x = x, y = y, vx = 0, vy = 0, id = maxId + 1, state = flip model.currentLevel state }
+                                |> Result.withDefault VoronoiDiagram2d.empty
             in
             { model | diagram = diagram, simulation = updateSimulation screen diagram }
 
@@ -471,7 +481,7 @@ computeEdge a b =
     }
 
 
-updateAreas : BoundingBox2d -> VoronoiDiagram2d Site -> { nature : Float, human : Float, ocean : Float }
+updateAreas : BoundingBox2d -> VoronoiDiagram2d Site -> { nature : Float, human : Float, ocean : Float, fire : Float }
 updateAreas screen diagram =
     diagram
         |> VoronoiDiagram2d.polygons screen
@@ -486,12 +496,15 @@ updateAreas screen diagram =
 
                     Ocean ->
                         { totals | ocean = totals.ocean + Polygon2d.area poly }
+
+                    Fire _ ->
+                        { totals | fire = totals.fire + Polygon2d.area poly }
             )
-            { human = 0, nature = 0, ocean = 0 }
+            { human = 0, nature = 0, ocean = 0, fire = 0 }
 
 
-aboutEqual : Level -> BoundingBox2d -> { nature : Float, human : Float, ocean : Float } -> Bool
-aboutEqual level screen { nature, human, ocean } =
+aboutEqual : Level -> BoundingBox2d -> { nature : Float, human : Float, ocean : Float, fire : Float } -> Bool
+aboutEqual level screen { nature, human, ocean, fire } =
     let
         ( w, h ) =
             BoundingBox2d.dimensions screen
@@ -508,6 +521,9 @@ aboutEqual level screen { nature, human, ocean } =
 
                         Ocean ->
                             ocean
+
+                        Fire _ ->
+                            fire
                 )
                 level.stateDistribution
 
@@ -534,7 +550,7 @@ aboutEqual level screen { nature, human, ocean } =
 
 type alias Rule =
     ( Site -> List ( Site, Polygon2d ) -> Maybe Float
-    , Site -> Random.Generator (List Site)
+    , Site -> Polygon2d -> Random.Generator (List Site)
     )
 
 
@@ -549,6 +565,19 @@ evaluateRules delta screen sites model =
 
         ( ( newSites, removals ), seed ) =
             Random.step (ruleEngine delta screen sites neigborhood model) model.seed
+
+        _ =
+            Array.toList newSites
+                |> List.filterMap
+                    (\s ->
+                        case s.state of
+                            Fire int ->
+                                Just int
+
+                            _ ->
+                                Nothing
+                    )
+                |> Debug.log "res states"
 
         diagram =
             buildDiagram newSites
@@ -608,9 +637,11 @@ ruleEngine delta screen sites neigborhood model =
     let
         ruleset =
             [ outOfBoundsEliminationRule screen
-            , jiggleRule model.currentLevel.frenzy
+
+            -- , jiggleRule model.currentLevel.frenzy
             , subsumptionRule
             , isolationRule
+            , burnRule delta
             ]
 
         normalized =
@@ -647,13 +678,20 @@ ruleEngine delta screen sites neigborhood model =
                                 currentNeigbors =
                                     Dict.get site.id neigbors |> Maybe.withDefault []
                             in
-                            Maybe.map (\p -> ( p * normalized, evalFn site )) (probFn site currentNeigbors)
+                            Maybe.map (\p -> ( p * normalized, evalFn )) (probFn site currentNeigbors)
                         )
                         ruleset
             in
-            Random.weighted ( 1 - List.sum (List.map Tuple.first applicableRules), Random.constant [ site ] )
+            Random.weighted ( 1 - List.sum (List.map Tuple.first applicableRules), \_ _ -> Random.constant [ site ] )
                 applicableRules
-                |> Random.andThen identity
+                |> Random.andThen
+                    (\evalFn ->
+                        evalFn site
+                            (Dict.get site.id neigborhood
+                                |> Maybe.map Tuple.second
+                                |> Maybe.withDefault (Polygon2d.singleLoop [])
+                            )
+                    )
     in
     sites
         |> List.foldr
@@ -680,14 +718,33 @@ ruleEngine delta screen sites neigborhood model =
                     gen
             )
             (Random.constant ( [], [] ))
-        |> Random.map (Tuple.mapFirst Array.fromList)
+        |> Random.map
+            (Tuple.mapFirst
+                (\s ->
+                    let
+                        maxId =
+                            List.foldl (\{ id } -> max id) -1 s
+                    in
+                    Array.fromList
+                        (List.indexedMap
+                            (\i item ->
+                                if item.id == -1 then
+                                    { item | id = maxId + i }
+
+                                else
+                                    item
+                            )
+                            s
+                        )
+                )
+            )
 
 
-withProbabilites : ({ nature : Maybe Float, ocean : Maybe Float, human : Maybe Float } -> { nature : Maybe Float, ocean : Maybe Float, human : Maybe Float }) -> (Site -> Random.Generator (List Site)) -> Rule
+withProbabilites : ({ nature : Maybe Float, ocean : Maybe Float, human : Maybe Float, fire : Maybe Float } -> { nature : Maybe Float, ocean : Maybe Float, human : Maybe Float, fire : Maybe Float }) -> (Site -> Polygon2d -> Random.Generator (List Site)) -> Rule
 withProbabilites probs fn =
     let
         p =
-            probs { nature = Nothing, ocean = Nothing, human = Nothing }
+            probs { nature = Nothing, ocean = Nothing, human = Nothing, fire = Nothing }
     in
     ( \site _ ->
         case site.state of
@@ -699,12 +756,24 @@ withProbabilites probs fn =
 
             Human ->
                 p.human
+
+            Fire _ ->
+                p.fire
     , fn
     )
 
 
-eliminate : a -> Random.Generator (List b)
-eliminate _ =
+eliminate : a -> c -> Random.Generator (List b)
+eliminate _ _ =
+    Random.constant []
+
+
+eliminateAndLog : String -> Site -> a -> Random.Generator (List Site)
+eliminateAndLog l site _ =
+    let
+        _ =
+            Debug.log (l ++ " fired for site ") site
+    in
     Random.constant []
 
 
@@ -716,14 +785,18 @@ outOfBoundsEliminationRule screen =
 
         else
             Just 0.1
-    , eliminate
+    , eliminateAndLog "outOfBoundsEliminationRule"
     )
 
 
 jiggleRule : Float -> Rule
 jiggleRule frenzy =
     withProbabilites (\r -> { r | nature = Just (0.2 * frenzy) })
-        (\site ->
+        (\site _ ->
+            let
+                _ =
+                    Debug.log "jiggleRule fired for site " site
+            in
             Random.map4 (\x0 x1 y0 y1 -> [ { site | vx = x0 + x1, vy = y0 + y1 } ])
                 (Random.float -5 5)
                 (Random.float -5 5)
@@ -743,7 +816,7 @@ subsumptionRule =
 
         else
             Nothing
-    , eliminate
+    , eliminateAndLog "subsumptionRule"
     )
 
 
@@ -759,8 +832,27 @@ isolationRule =
 
         else
             Nothing
-    , eliminate
+    , eliminateAndLog "isolationRule"
     )
+
+
+burnRule : Float -> Rule
+burnRule delta =
+    withProbabilites (\p -> { p | fire = Just 0.9 })
+        (\site poly ->
+            case Debug.log "burn" site.state of
+                Fire intensity ->
+                    if intensity - Debug.log "delta" delta > 0 then
+                        Random.constant (Debug.log "res" [ { site | state = Fire (intensity - delta) } ])
+
+                    else
+                        Polygon2d.vertices poly
+                            |> List.map (\vertex -> Random.map (\newIntensity -> { id = -1, state = Fire newIntensity, x = Point2d.xCoordinate vertex, y = Point2d.yCoordinate vertex, vx = 0, vy = 0 }) (Random.float 5000 8000))
+                            |> List.foldl (Random.map2 (::)) (Random.constant [])
+
+                _ ->
+                    Random.constant []
+        )
 
 
 
@@ -790,6 +882,9 @@ flip level cell =
 
         Ocean ->
             Ocean
+
+        Fire a ->
+            Fire a
 
 
 siteToPoint : Site -> Point2d
@@ -942,7 +1037,7 @@ particleView particles =
                         , TypedSvg.path [ TypedSvg.Attributes.d "M7 0v18L0 9Z", fill (Fill (Color.rgb 0.32 0.32 0.29)) ] []
                         ]
 
-                Ocean ->
+                _ ->
                     g [] []
         )
         particles
@@ -1281,10 +1376,32 @@ renderDiagram clip diagram additional =
 
                     Ocean ->
                         0
+
+                    Fire _ ->
+                        3
             )
         |> List.concatMap
-            (\( { state, x, y }, poly ) ->
+            (\( { state, x, y, id }, poly ) ->
                 case state of
+                    Fire intensity ->
+                        [ Geometry.Svg.polygon2d
+                            [ fill (Fill (stateToColor state))
+                            , stroke (Color.rgb 0.86 0.81 0.09)
+                            , strokeWidth 2
+                            , custom "click"
+                                (D.map
+                                    (\( clx, cly ) ->
+                                        { message = Clicked id state clx cly
+                                        , stopPropagation = True
+                                        , preventDefault = True
+                                        }
+                                    )
+                                    decodeMousePosition
+                                )
+                            ]
+                            poly
+                        ]
+
                     Ocean ->
                         [ Geometry.Svg.polygon2d
                             [ fill (Fill (stateToColor state))
@@ -1294,7 +1411,7 @@ renderDiagram clip diagram additional =
                             , custom "click"
                                 (D.map
                                     (\( clx, cly ) ->
-                                        { message = Clicked state clx cly
+                                        { message = Clicked id state clx cly
                                         , stopPropagation = True
                                         , preventDefault = True
                                         }
@@ -1314,7 +1431,7 @@ renderDiagram clip diagram additional =
                             , custom "click"
                                 (D.map
                                     (\( clx, cly ) ->
-                                        { message = Clicked state clx cly
+                                        { message = Clicked id state clx cly
                                         , stopPropagation = True
                                         , preventDefault = True
                                         }
@@ -1356,7 +1473,7 @@ renderDiagram clip diagram additional =
                                         , custom "click"
                                             (D.map
                                                 (\( clx, cly ) ->
-                                                    { message = Clicked state clx cly
+                                                    { message = Clicked id state clx cly
                                                     , stopPropagation = True
                                                     , preventDefault = True
                                                     }
@@ -1392,6 +1509,10 @@ computeCurve points =
                 |> List.singleton
 
 
+fireScale =
+    Scale.quantize ( Color.rgb 0.39 0 0, [ Color.rgb 0.58 0 0, Color.rgb 0.8 0 0, Color.rgb 0.87 0 0, Color.rgb 1 0.44 0, Color.rgb 1 0.51 0.11, Color.rgb 0.99 0.9 0.61 ] ) ( 8000, 0 )
+
+
 stateToColor : CellState -> Color
 stateToColor state =
     case state of
@@ -1403,6 +1524,9 @@ stateToColor state =
 
         Ocean ->
             Color.rgb 0.1 0.1 0.8
+
+        Fire intensity ->
+            Scale.convert fireScale intensity
 
 
 decodeMousePosition : Decoder ( Float, Float )
